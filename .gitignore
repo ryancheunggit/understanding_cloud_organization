@@ -1,0 +1,6 @@
+data
+log
+model
+submission
+__pycache__
+*.pyc
