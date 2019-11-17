@@ -1,5 +1,6 @@
 import argparse
 import cv2
+import os
 import torch
 import numpy as np
 import pandas as pd
@@ -14,38 +15,57 @@ from util import set_seed, write_log, mask2rle
 from data import get_train_metadata, get_test_metadata, get_train_test_split, CloudDataset
 from model import get_model, RAdam, DiceLoss, tta, post_process, load_model
 from metric import EarlyStopping, AverageMeter, get_auc_scores, SegMeter
+from loss import lovasz_hinge
 
 
+parser = argparse.ArgumentParser(description='parameters for program')
+parser.add_argument('--gpu', type=str, default='0')
+parser.add_argument('--batch_size', type=int, default=32)
+parser.add_argument('--grad_accum', type=int, default=1)
+parser.add_argument('--encoder', type=str, default='efficientnet-b3')
+parser.add_argument('--decoder', type=str, default='unet')
+parser.add_argument('--height', type=int, default=384)
+parser.add_argument('--width', type=int, default=576)
+parser.add_argument('--fold', type=int, default=0)
+parser.add_argument('--blackout', type=float, default=0.)
+parser.add_argument('--lovasz_hinge', type=int, default=-1)
+args = parser.parse_args()
+
+os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 cudnn.deterministic = True
 cudnn.benchmark = True
 
-parser = argparse.ArgumentParser(description='parameters for program')
-parser.add_argument('--fold', type=int, default=1)
-args = parser.parse_args()
+CLASS_TARGETS = ['Fish', 'Flower', 'Gravel', 'Sugar']
 
 FOLD = args.fold
-MODEL_NAME = 'unet_efficientnet-b3_384_576'
+H = args.height
+W = args.width
+ENCODER_NAME = args.encoder
+DECODER_NAME = args.decoder
+BATCH_SIZE = args.batch_size
+GRAD_ACCUM = args.grad_accum
+BLACKOUT = args.blackout
+LOVASZ_HINGE = args.lovasz_hinge
+
+MODEL_NAME = '{}_{}_{}_{}'.format(DECODER_NAME, ENCODER_NAME, H, W)
+if BLACKOUT:
+    MODEL_NAME += '_blackout_p_{}'.format(BLACKOUT)
+if LOVASZ_HINGE >= 0:
+    MODEL_NAME += '_lovasz_hinge_{}'.format(LOVASZ_HINGE)
 LOG_FILE = '../log/{}_fold_{}.txt'.format(MODEL_NAME, FOLD)
 MODEL_CHECKPOINT = '../model/{}_fold_{}.pth'.format(MODEL_NAME, FOLD)
 SUB_FILE = '../submission/{}_fold_{}.csv'.format(MODEL_NAME, FOLD)
 
-CLASS_TARGETS = ['Fish', 'Flower', 'Gravel', 'Sugar']
-
-BATCH_SIZE = 32
-NUM_WORKERS = 8
+NUM_WORKERS = 5
 MAX_EPOCH = 90
 EARLY_STOP = 7
-INITIAL_LR = 1e-3  # 3e-4
-GRAD_ACCUM = 1
+INITIAL_LR = 1e-3
 W1, W2, W3 = 1, 1, 1
-
-ENCODER_NAME = 'efficientnet-b3'  # 'se_resnext50_32x4d'
-DECODER_NAME = 'unet'
 UNET_ATTEN = False
 FPN_DROPOUT = .2
 
 TRAIN = 1
-PREDICT = 1
+PREDICT = 0
 
 set_seed(42)
 train_running_message = '\r-- epoch {:>3} - iter {:>5} - secs per batch {:4.2f} - train clf bce loss {:5.4f} seg bce loss {:5.4f} dice loss {:5.4f}'
@@ -60,15 +80,15 @@ folds = get_train_test_split(metadata)
 train_idx, valid_idx = folds[FOLD]
 train_meta = metadata.iloc[train_idx].copy()
 valid_meta = metadata.iloc[valid_idx].copy()
-train_ds = CloudDataset(train_meta, mode='train')
-train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+train_ds = CloudDataset(train_meta, mode='train', blackout_p=BLACKOUT, H=H, W=W)
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=False)
 valid_ds = CloudDataset(valid_meta, mode='valid')
-valid_dl = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+valid_dl = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=False)
 
 model = get_model(ENCODER_NAME, DECODER_NAME, UNET_ATTEN, FPN_DROPOUT).cuda()
 clf_criterion = nn.BCEWithLogitsLoss()
-seg_bce_criterion = nn.BCEWithLogitsLoss()
-seg_dice_criterion = DiceLoss()
+seg_criterion_1 = nn.BCEWithLogitsLoss()
+seg_criterion_2 = DiceLoss()
 optimizer = RAdam(model.parameters(), lr=INITIAL_LR)  # Adam(model.parameters(), lr=INITIAL_LR)
 scheduler = ReduceLROnPlateau(optimizer, mode='max', patience=2, verbose=1, min_lr=1e-7, factor=.1)
 earlystop = EarlyStopping(mode='max', patience=EARLY_STOP, percentage=False)
@@ -78,10 +98,12 @@ model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
 if TRAIN:
     best_score, best_epoch, history = 0, 0, pd.DataFrame()
     for epoch in range(MAX_EPOCH):
+        if LOVASZ_HINGE >= 0 and epoch + 1 >= LOVASZ_HINGE:
+            seg_criterion_1 = lovasz_hinge
         tt0 = datetime.now()
         clf_loss_meter = AverageMeter()
-        seg_bce_loss_meter = AverageMeter()
-        seg_dice_loss_meter = AverageMeter()
+        seg_loss_1_meter = AverageMeter()
+        seg_loss_2_meter = AverageMeter()
         seg_metric_meter = SegMeter()
         train_clf_labels, train_clf_preds = [], []
 
@@ -94,9 +116,9 @@ if TRAIN:
             clf_logits, seg_logits = model(images)
 
             clf_loss = clf_criterion(clf_logits, classes)
-            seg_bce_loss = seg_bce_criterion(seg_logits, masks)
-            seg_dice_loss = seg_dice_criterion(seg_logits, masks)
-            loss = W1 * clf_loss + W2 * seg_bce_loss + W3 * seg_dice_loss
+            seg_loss_1 = seg_criterion_1(seg_logits, masks)
+            seg_loss_2 = seg_criterion_2(seg_logits, masks)
+            loss = W1 * clf_loss + W2 * seg_loss_1 + W3 * seg_loss_2
 
             if GRAD_ACCUM > 1:
                 loss = loss / GRAD_ACCUM
@@ -110,14 +132,14 @@ if TRAIN:
             train_clf_preds.append(clf_logits.sigmoid().cpu().detach().numpy())
 
             clf_loss_meter.update(clf_loss.cpu().detach().numpy())
-            seg_bce_loss_meter.update(seg_bce_loss.cpu().detach().numpy())
-            seg_dice_loss_meter.update(seg_dice_loss.cpu().detach().numpy())
+            seg_loss_1_meter.update(seg_loss_1.cpu().detach().numpy())
+            seg_loss_2_meter.update(seg_loss_2.cpu().detach().numpy())
             seg_metric_meter.update(masks, clf_logits, seg_logits)
 
             dt = (datetime.now() - t0).total_seconds()
             message = train_running_message.format(
                 epoch + 1, it, dt,
-                clf_loss_meter.avg, seg_bce_loss_meter.avg, seg_dice_loss_meter.avg
+                clf_loss_meter.avg, seg_loss_1_meter.avg, seg_loss_2_meter.avg
             )
             print(message, end='', flush=True)
 
@@ -145,8 +167,8 @@ if TRAIN:
 
         tt0 = datetime.now()
         clf_loss_meter = AverageMeter()
-        seg_bce_loss_meter = AverageMeter()
-        seg_dice_loss_meter = AverageMeter()
+        seg_loss_1_meter = AverageMeter()
+        seg_loss_2_meter = AverageMeter()
         seg_focal_loss_meter = AverageMeter()
         seg_metric_meter = SegMeter()
         valid_clf_preds = []
@@ -159,20 +181,20 @@ if TRAIN:
                 images, classes, masks = images.cuda(), classes.cuda().float(), masks.cuda()
                 clf_logits, seg_logits = tta(images, model)
                 clf_loss = clf_criterion(clf_logits, classes)
-                seg_bce_loss = seg_bce_criterion(seg_logits, masks)
-                seg_dice_loss = seg_dice_criterion(seg_logits, masks)
+                seg_loss_1 = seg_criterion_1(seg_logits, masks)
+                seg_loss_2 = seg_criterion_2(seg_logits, masks)
 
                 valid_clf_preds.append(clf_logits.sigmoid().cpu().detach().numpy())
 
                 clf_loss_meter.update(clf_loss.cpu().detach().numpy())
-                seg_bce_loss_meter.update(seg_bce_loss.cpu().detach().numpy())
-                seg_dice_loss_meter.update(seg_dice_loss.cpu().detach().numpy())
+                seg_loss_1_meter.update(seg_loss_1.cpu().detach().numpy())
+                seg_loss_2_meter.update(seg_loss_2.cpu().detach().numpy())
                 seg_metric_meter.update(masks, clf_logits, seg_logits)
 
                 dt = (datetime.now() - t0).total_seconds()
                 message = valid_running_message.format(
                     epoch + 1, it, dt,
-                    clf_loss_meter.avg, seg_bce_loss_meter.avg, seg_dice_loss_meter.avg,
+                    clf_loss_meter.avg, seg_loss_1_meter.avg, seg_loss_2_meter.avg,
                 )
                 print(message, end='', flush=True)
         valid_clf_preds = np.vstack(valid_clf_preds)

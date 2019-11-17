@@ -45,7 +45,6 @@ for idx, (fnames, images) in tqdm(enumerate(test_dl, 1), total=len(test_dl)):
                 new_logits, new_masks = tta(images, model)
                 logits += new_logits / n
                 masks += new_masks / n
-
         masks = torch.sigmoid(masks).detach().cpu().numpy()
         probas = torch.sigmoid(logits).detach().cpu().numpy()
     for fname, mask, proba in zip(fnames, masks, probas):
