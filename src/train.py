@@ -50,13 +50,13 @@ LOVASZ_HINGE = args.lovasz_hinge
 MODEL_NAME = '{}_{}_{}_{}'.format(DECODER_NAME, ENCODER_NAME, H, W)
 if BLACKOUT:
     MODEL_NAME += '_blackout_p_{}'.format(BLACKOUT)
-if LOVASZ_HINGE >= 0:
+if LOVASZ_HINGE:
     MODEL_NAME += '_lovasz_hinge_{}'.format(LOVASZ_HINGE)
 LOG_FILE = '../log/{}_fold_{}.txt'.format(MODEL_NAME, FOLD)
 MODEL_CHECKPOINT = '../model/{}_fold_{}.pth'.format(MODEL_NAME, FOLD)
 SUB_FILE = '../submission/{}_fold_{}.csv'.format(MODEL_NAME, FOLD)
 
-NUM_WORKERS = 5
+NUM_WORKERS = 8
 MAX_EPOCH = 90
 EARLY_STOP = 7
 INITIAL_LR = 1e-3
@@ -68,10 +68,10 @@ TRAIN = 1
 PREDICT = 0
 
 set_seed(42)
-train_running_message = '\r-- epoch {:>3} - iter {:>5} - secs per batch {:4.2f} - train clf bce loss {:5.4f} seg bce loss {:5.4f} dice loss {:5.4f}'
-train_epoch_end_message = '\r-- epoch {:>3} - secs total {:4.2f} - train auc {:5.4f}  clf bce loss {:5.4f} - best dice score is {:5.4f} with threshold value {} and details:'
-valid_running_message = '\r-- epoch {:>3} - iter {:>5} - secs per batch {:4.2f} - valid clf bce loss {:5.4f} seg bce loss {:5.4f} dice loss {:5.4f}'
-valid_epoch_end_message = '\r-- epoch {:>3} - secs total {:4.2f} - valid auc {:5.4f}  clf bce loss {:5.4f} - best dice score is {:5.4f} with threshold value {} and details:'
+train_running_message = '\r-- epoch {:>3} - iter {:>5} - secs per batch {:4.2f} - train clf loss {:5.4f} seg loss {:5.4f} dice loss {:5.4f}'
+train_epoch_end_message = '\r-- epoch {:>3} - secs total {:4.2f} - train auc {:5.4f}  clf loss {:5.4f} - best dice score is {:5.4f} with threshold value {} and details:'
+valid_running_message = '\r-- epoch {:>3} - iter {:>5} - secs per batch {:4.2f} - valid clf loss {:5.4f} seg loss {:5.4f} dice loss {:5.4f}'
+valid_epoch_end_message = '\r-- epoch {:>3} - secs total {:4.2f} - valid auc {:5.4f}  clf loss {:5.4f} - best dice score is {:5.4f} with threshold value {} and details:'
 auc_message = '-- per label auc score: Fish {:5.4f} Flower {:5.4f} Gravel {:5.4f} Sugar {:5.4f}'
 
 
@@ -81,9 +81,9 @@ train_idx, valid_idx = folds[FOLD]
 train_meta = metadata.iloc[train_idx].copy()
 valid_meta = metadata.iloc[valid_idx].copy()
 train_ds = CloudDataset(train_meta, mode='train', blackout_p=BLACKOUT, H=H, W=W)
-train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=False)
+train_dl = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
 valid_ds = CloudDataset(valid_meta, mode='valid')
-valid_dl = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=False)
+valid_dl = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
 model = get_model(ENCODER_NAME, DECODER_NAME, UNET_ATTEN, FPN_DROPOUT).cuda()
 clf_criterion = nn.BCEWithLogitsLoss()
@@ -98,7 +98,7 @@ model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
 if TRAIN:
     best_score, best_epoch, history = 0, 0, pd.DataFrame()
     for epoch in range(MAX_EPOCH):
-        if LOVASZ_HINGE >= 0 and epoch + 1 >= LOVASZ_HINGE:
+        if LOVASZ_HINGE and epoch + 1 >= LOVASZ_HINGE:
             seg_criterion_1 = lovasz_hinge
         tt0 = datetime.now()
         clf_loss_meter = AverageMeter()

@@ -73,13 +73,17 @@ def get_train_test_split(metadata, num_folds=5, random_state=42):
     return folds
 
 
-def blackout(blackout_p, image, classes, masks):
+def blackout(blackout_p, image, classes, masks, version=2):
     if classes.sum() > 0 and np.random.random() <= blackout_p:
         idx = np.random.choice(np.where(classes > .5)[0])
         classes[idx] = 0
-        mask = masks[:, :, idx] == 1
-        image[mask] = 0
-        masks[mask] = 0
+        if version == 1:
+            image[masks[:, :, idx] == 1] = 0
+            masks[:, :, idx] == 0
+        else:
+            mask = masks[:, :, idx] == 1
+            image[mask] = 0
+            masks[mask] = 0
     return image, classes, masks
 
 
